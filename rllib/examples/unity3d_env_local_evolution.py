@@ -23,7 +23,10 @@ $ python unity3d_env_local.py --env 3DBall --stop-reward [..]
 
 import argparse
 import os
+from pickletools import read_uint1
 import re
+from select import epoll
+from prometheus_client import MetricsHandler
 
 import ray
 from ray import tune
@@ -32,11 +35,21 @@ from ray.rllib.utils.test_utils import check_learning_achieved
 from ray.rllib.agents.ppo.ppo import PPOTrainer
 import logging
 from typing import List, Optional, Type, Union, Callable
+from gym.spaces import Box, MultiDiscrete, Tuple as TupleSpace
+from ray.rllib.policy.policy import PolicySpec
 
 from ray.util.debug import log_once
 from ray.rllib.agents.ppo.ppo_tf_policy import PPOTFPolicy
+from ray.rllib.agents.ppo.ppo_torch_policy import PPOTorchPolicy
+from ray.rllib.evaluation.worker_set import WorkerSet
 from ray.rllib.agents.trainer import Trainer
+from python.ray.rllib.evaluation.rollout_worker import RolloutWorker
 from ray.rllib.agents.trainer_config import TrainerConfig
+from ray.rllib.evaluation.metrics import (
+    collect_episodes,
+    collect_metrics,
+    summarize_episodes,
+)
 from ray.rllib.execution.rollout_ops import (
     standardize_fields,
 )
@@ -66,22 +79,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--env",
     type=str,
-    default="3DBall",
+    default="XlandFindObject",
     choices=[
-        "3DBall",
-        "3DBallHard",
-        "GridFoodCollector",
-        "Pyramids",
-        "SoccerStrikersVsGoalie",
-        "SoccerTwos",
-        "Sorter",
-        "Tennis",
-        "VisualHallway",
-        "Walker",
+        "MazeFood",
+        "XlandFindObject",
     ],
-    help="The name of the Env to run in the Unity3D editor: `3DBall(Hard)?|"
-    "Pyramids|GridFoodCollector|SoccerStrikersVsGoalie|Sorter|Tennis|"
-    "VisualHallway|Walker` (feel free to add more and PR!)",
+    help="The name of the Env to run in the Unity3D editor: `MazeFood | XlandFindObject `",
 )
 parser.add_argument(
     "--file-name",
@@ -131,14 +134,81 @@ parser.add_argument(
     help="The DL framework specifier.",
 )
 
-def get_env_height_map(env_class):
-    pass
 
-def conditonal_wfc_mutation(env_file):
-    pass
+# Add WFC and gRPC support for unity3D RLLib enviroment
+# TODO: finish the implementation and UnitTest
+class WFCUnity3DEnv(Unity3DEnv):
+    def __init__(self,
+                 file_name: str = None,
+                 port: Optional[int] = None,
+                 seed: int = 0,
+                 no_graphics: bool = False,
+                 timeout_wait: int = 300,
+                 episode_horizon: int = 1000):
+        super().__init__(file_name, port, seed, no_graphics, timeout_wait, episode_horizon)
 
 
+        self.height_map = None
+        if config['map_image'] is not None and config['map_image'] != self.height_map:
+            self.height_map = config['map_image']
+            self.render_new_map(self.height_map)
+        pass
+
+    @staticmethod
+    def get_policy_configs_for_game(game_name: str):
+        obs_spaces = {
+                 "MazeFood": Box(float("-inf"), float("inf"), (84, 84, 3)),
+                "XlandFindObject": Box(float("-inf"), float("inf"), (84, 84, 3))
+            }
+        action_spaces = {
+            # MazeFood Continous.
+            "MazeFood": Box(
+                float("-inf"), float("inf"), (2, ), dtype=np.float32),
+            # XlandFindObject.
+            "XlandFindObject": MultiDiscrete([9]),
+        }
+        policies = {
+        game_name: PolicySpec(
+            observation_space=obs_spaces[game_name],
+            action_space=action_spaces[game_name]),
+        }
+
+        def policy_mapping_fn(agent_id, episode, worker, **kwargs):
+            return game_name
+        return policies, policy_mapping_fn
+            
+
+
+    def render_new_map(self, mapimg):
+        with self.get_grpc_channel() as channel :
+            unity_grpc = grpc.connect(channel)
+            return unity_grpc.render_new_map(mapimg) 
+    
+    # conditoinal WFC mutation
+    def generate_new_height_map(self, mapimg=None):
+        if not mapimg:
+            mapimg = self.height_map
+        pass
+    
+    def get_height_map(self):
+        pass
+
+    def save_height_map(self):
+        pass
+
+
+def env_creator(config):
+    rllib_env = WFCUnity3DEnv(
+            file_name=config["file_name"],
+            no_graphics=(args.env != "VisualHallway" and config["file_name"] is not None),
+            episode_horizon=config["episode_horizon"],
+        )
+    return rllib_env
+
+
+# TODO: Implement this Trainer and pass UnitTest
 class Unity3DTrainer(PPOTrainer):
+    @override(Trainer)
     def evaluate(
             self,
             episodes_left_fn=None,  # deprecated
@@ -150,32 +220,46 @@ class Unity3DTrainer(PPOTrainer):
         return evaluation_metrics
     
     def _after_evaluate(self, evaluation_metrics):
+        logger.debug(f"Initial Evaluation metrics: {evaluation_metrics}")
         """After-evaluation callback."""
-        metrics = evaluation_metrics['evaluation']
-        eposides_reward = np.array(metrics['hist_stats']['episode_reward'])
-        nonzero_episodes = (eposides_reward > 0).sum()
-
+        def should_continue(results):
+            eposides_reward = np.array(results['evaluation']['hist_stats']['episode_reward'])
+            nonzero_episodes = (eposides_reward > 0).sum()
+            # Map is too easy since there are too many succussful episodes 
+            return nonzero_episodes >= (len(eposides_reward) // 2)
+        metric = evaluation_metrics
+        count = 0
+        config = self.config.copy()
         # is Time to evolute a new map
-        should_evolve = (nonzero_episodes > 0 and nonzero_episodes < len(eposides_reward) // 2)
-        if should_evolve: 
-            logger.info(f"Start Evolving map")
-            cuurent_env_height_map = get_env_height_map(self.env)
-            new_env_map = conditonal_wfc_mutation(cuurent_env_height_map)
-
-
-
-def env_creator(config):
-    rllib_env = Unity3DEnv(
-            file_name=config["file_name"],
-            no_graphics=(args.env != "VisualHallway" and config["file_name"] is not None),
-            episode_horizon=config["episode_horizon"],
-        )
-    with rllib_env.get_grpc_channel() as channel:
-        unity_grpc = grpc.connect(channel)
-        logger.info("Waiting for map to load...")
-        unity_grpc.load_new_map(config['map_name']) 
-        logger.info("Map loaded")
-    return rllib_env
+        while should_continue(metric):
+            count += 1
+            logger.info(f"Start Evolving map for the {count} time")
+            new_env_map = self.workers.local_worker().env.generate_new_height_map()
+            config['map_img'] = new_env_map
+            logger.info(f"Evaluating the evolved map now")
+            # Create a rollout worker and using it to collect experiences.
+            evolute_worker = WorkerSet(
+                env_creator=lambda c: env_creator(c),
+                trainer_config=config,
+                policy_class=self.get_default_policy_class(config),
+                num_workers=0,
+                local_worker=True
+            )
+            evolute_worker.sync_weights(
+                from_worker=self.workers.local_worker()
+            )
+            self._sync_filters_if_needed(evolute_worker)
+            metric = {"evaluation": collect_metrics(evolute_worker)}
+            logger.debug(f"Map Evaluation metrics: {metric}")
+            logger.info(f"{count} time Map Evaluation Done")
+        logger.info("Got a New Map!")
+        logger.debug(f"New Map Evaluation metrics: {metric}")
+        self.config['map_img'] = new_env_map
+        # Rendering the new map for next training_iteration
+        def fn(env, env_context):
+            env.render_new_map(env_context['map_img'])
+        self.workers.foreach_env_with_context(fn)
+        self.evaluation_workers.foreach_env_with_context(fn)
 
 
 if __name__ == "__main__":
@@ -220,34 +304,9 @@ if __name__ == "__main__":
         "model": {
             "fcnet_hiddens": [512, 512],
         },
-        "framework": "tf" if args.env != "Pyramids" else "torch",
+        "framework": "tf",
         "no_done_at_end": True,
     }
-    # Switch on Curiosity based exploration for Pyramids env
-    # (not solvable otherwise).
-    if args.env == "Pyramids":
-        config["exploration_config"] = {
-            "type": "Curiosity",
-            "eta": 0.1,
-            "lr": 0.001,
-            # No actual feature net: map directly from observations to feature
-            # vector (linearly).
-            "feature_net_config": {
-                "fcnet_hiddens": [],
-                "fcnet_activation": "relu",
-            },
-            "sub_exploration": {
-                "type": "StochasticSampling",
-            },
-            "forward_net_activation": "relu",
-            "inverse_net_activation": "relu",
-        }
-    elif args.env == "GridFoodCollector":
-        config["model"] = {
-            "conv_filters": [[16, [4, 4], 2], [32, [4, 4], 2], [256, [10, 10], 1]],
-        }
-    elif args.env == "Sorter":
-        config["model"]["use_attention"] = True
 
     stop = {
         "training_iteration": args.stop_iters,
